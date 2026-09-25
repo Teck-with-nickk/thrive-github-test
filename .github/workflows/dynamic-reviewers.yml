@@ -8,20 +8,37 @@ on:
       - reopened
       - ready_for_review
 
+  pull_request_review:
+    types:
+      - submitted
+      - edited
+      - dismissed
+
 permissions:
   contents: read
   pull-requests: write
 
 jobs:
+
+  # ============================================================
+  # JOB 1
+  # Find reviewer teams and request them on the PR
+  # ============================================================
+
   request-reviewers:
     name: Request Dynamic Reviewers
+
+    if: github.event_name == 'pull_request_target'
+
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Get changed files
         id: changed-files
         uses: actions/github-script@v8
         with:
+          github-token: ${{ secrets.DYNAMIC_REVIEWER_TOKEN }}
           script: |
             const { owner, repo } = context.repo;
             const pull_number = context.payload.pull_request.number;
@@ -57,18 +74,19 @@ jobs:
       - name: Checkout base branch
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ github.event.pull_request.base.ref }}
           fetch-depth: 1
 
       - name: Install PyYAML
         run: |
           pip install pyyaml
 
-      - name: Find reviewers
+      - name: Find reviewer teams
         id: reviewers
         shell: bash
         env:
           CHANGED_FILES: ${{ steps.changed-files.outputs.files }}
+
         run: |
           python - <<'PY'
           import json
@@ -84,10 +102,14 @@ jobs:
           print("Processing changed YAML files...")
 
           for file in changed_files:
+
               print(f"\nChecking: {file}")
 
               if not os.path.exists(file):
-                  print("  File does not exist in base branch. Skipping.")
+                  print(
+                      "  File does not exist in base branch. "
+                      "Skipping for now."
+                  )
                   continue
 
               with open(file, "r", encoding="utf-8") as f:
@@ -95,15 +117,18 @@ jobs:
 
               reviewer = data.get("reviewer", {})
 
-              if isinstance(reviewer, dict):
-                  team = reviewer.get("team")
+              if not isinstance(reviewer, dict):
+                  print("  Invalid reviewer configuration.")
+                  continue
+
+              team = reviewer.get("team")
+
+              if team:
+                  team = str(team).strip()
 
                   if team:
-                      team = str(team).strip()
-
-                      if team:
-                          print(f"  Reviewer team: {team}")
-                          teams.add(team)
+                      print(f"  Reviewer team: {team}")
+                      teams.add(team)
 
           teams = sorted(teams)
 
@@ -124,25 +149,27 @@ jobs:
               "a",
               encoding="utf-8"
           ) as output:
+
               output.write(
                   f"teams={json.dumps(teams)}\n"
               )
-          PY
 
       - name: Request team reviewers
         if: steps.reviewers.outputs.teams != '[]'
         uses: actions/github-script@v8
         env:
           TEAMS: ${{ steps.reviewers.outputs.teams }}
+
         with:
           github-token: ${{ secrets.DYNAMIC_REVIEWER_TOKEN }}
+
           script: |
             const { owner, repo } = context.repo;
             const pull_number = context.payload.pull_request.number;
 
             const teams = JSON.parse(process.env.TEAMS);
 
-            console.log(`Requesting reviewer teams:`);
+            console.log("Requesting reviewer teams:");
 
             for (const team of teams) {
               console.log(`- ${team}`);
@@ -155,4 +182,307 @@ jobs:
               team_reviewers: teams
             });
 
-            console.log("Reviewer request completed successfully.");
+            console.log(
+              "Reviewer request completed successfully."
+            );
+
+
+  # ============================================================
+  # JOB 2
+  # Validate that every required team has approved
+  # ============================================================
+
+  validate-required-reviewers:
+    name: Validate Required Team Approvals
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Get changed files
+        id: changed-files
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.DYNAMIC_REVIEWER_TOKEN }}
+
+          script: |
+            const { owner, repo } = context.repo;
+            const pull_number =
+              context.payload.pull_request.number;
+
+            const files = await github.paginate(
+              github.rest.pulls.listFiles,
+              {
+                owner,
+                repo,
+                pull_number,
+                per_page: 100
+              }
+            );
+
+            const yamlFiles = files
+              .map(file => file.filename)
+              .filter(file =>
+                file.endsWith(".yml") ||
+                file.endsWith(".yaml")
+              );
+
+            console.log("Changed YAML files:");
+
+            for (const file of yamlFiles) {
+              console.log(`- ${file}`);
+            }
+
+            core.setOutput(
+              "files",
+              JSON.stringify(yamlFiles)
+            );
+
+      - name: Checkout base branch
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 1
+
+      - name: Install PyYAML
+        run: |
+          pip install pyyaml
+
+      - name: Find required teams
+        id: required-teams
+        shell: bash
+        env:
+          CHANGED_FILES: ${{ steps.changed-files.outputs.files }}
+
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import yaml
+
+          changed_files = json.loads(
+              os.environ["CHANGED_FILES"]
+          )
+
+          teams = set()
+
+          for file in changed_files:
+
+              if not os.path.exists(file):
+                  continue
+
+              with open(file, "r", encoding="utf-8") as f:
+                  data = yaml.safe_load(f) or {}
+
+              reviewer = data.get("reviewer", {})
+
+              if isinstance(reviewer, dict):
+
+                  team = reviewer.get("team")
+
+                  if team:
+                      teams.add(str(team).strip())
+
+          teams = sorted(
+              team for team in teams if team
+          )
+
+          print("Required teams:")
+
+          for team in teams:
+              print(f"- {team}")
+
+          with open(
+              os.environ["GITHUB_OUTPUT"],
+              "a",
+              encoding="utf-8"
+          ) as output:
+
+              output.write(
+                  f"teams={json.dumps(teams)}\n"
+              )
+          PY
+
+      - name: Validate team approvals
+        uses: actions/github-script@v8
+        env:
+          REQUIRED_TEAMS: ${{ steps.required-teams.outputs.teams }}
+
+        with:
+          github-token: ${{ secrets.DYNAMIC_REVIEWER_TOKEN }}
+
+          script: |
+            const { owner, repo } = context.repo;
+            const pull_number =
+              context.payload.pull_request.number;
+
+            const requiredTeams =
+              JSON.parse(process.env.REQUIRED_TEAMS);
+
+            console.log(
+              `Required teams: ${requiredTeams.join(", ")}`
+            );
+
+            if (requiredTeams.length === 0) {
+              console.log(
+                "No reviewer teams required."
+              );
+              return;
+            }
+
+            // ------------------------------------------------
+            // Get all PR reviews
+            // ------------------------------------------------
+
+            const reviews = await github.paginate(
+              github.rest.pulls.listReviews,
+              {
+                owner,
+                repo,
+                pull_number,
+                per_page: 100
+              }
+            );
+
+            // ------------------------------------------------
+            // Keep the latest review from each user
+            // ------------------------------------------------
+
+            const latestReviews = new Map();
+
+            for (const review of reviews) {
+
+              const login = review.user?.login;
+
+              if (!login) {
+                continue;
+              }
+
+              const existing =
+                latestReviews.get(login);
+
+              if (
+                !existing ||
+                new Date(review.submitted_at || 0) >
+                new Date(existing.submitted_at || 0)
+              ) {
+                latestReviews.set(
+                  login,
+                  review
+                );
+              }
+            }
+
+            console.log("\nLatest reviews:");
+
+            for (const [login, review] of latestReviews) {
+              console.log(
+                `- ${login}: ${review.state}`
+              );
+            }
+
+            // ------------------------------------------------
+            // Determine which teams have approved
+            // ------------------------------------------------
+
+            const approvedTeams = new Set();
+
+            for (const teamSlug of requiredTeams) {
+
+              console.log(
+                `\nChecking team: ${teamSlug}`
+              );
+
+              // Get team members
+              const members = await github.paginate(
+                github.rest.teams.listMembersInOrg,
+                {
+                  org: owner,
+                  team_slug: teamSlug,
+                  per_page: 100
+                }
+              );
+
+              const memberLogins = new Set(
+                members.map(member => member.login)
+              );
+
+              console.log(
+                `Team members: ${[
+                  ...memberLogins
+                ].join(", ")}`
+              );
+
+              // Check whether an approved reviewer
+              // belongs to this team.
+
+              for (const [login, review] of latestReviews) {
+
+                if (
+                  review.state === "APPROVED" &&
+                  memberLogins.has(login)
+                ) {
+                  approvedTeams.add(teamSlug);
+
+                  console.log(
+                    `✓ ${teamSlug} approved by ${login}`
+                  );
+
+                  break;
+                }
+              }
+            }
+
+            // ------------------------------------------------
+            // Print final result
+            // ------------------------------------------------
+
+            console.log(
+              "\n================================"
+            );
+
+            console.log(
+              "Required team approval status"
+            );
+
+            console.log(
+              "================================"
+            );
+
+            let missingTeams = [];
+
+            for (const team of requiredTeams) {
+
+              if (approvedTeams.has(team)) {
+
+                console.log(
+                  `✓ ${team}: APPROVED`
+                );
+
+              } else {
+
+                console.log(
+                  `✗ ${team}: NOT APPROVED`
+                );
+
+                missingTeams.push(team);
+              }
+            }
+
+            console.log(
+              "================================"
+            );
+
+            if (missingTeams.length > 0) {
+
+              core.setFailed(
+                "Missing required approvals from: " +
+                missingTeams.join(", ")
+              );
+
+            } else {
+
+              console.log(
+                "✓ All required teams have approved."
+              );
+            }
