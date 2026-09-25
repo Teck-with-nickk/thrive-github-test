@@ -129,8 +129,7 @@ jobs:
               )
           PY
 
-      - name: Request team reviewers
-        if: steps.reviewers.outputs.teams != '[]'
+      - name: Test team access
         uses: actions/github-script@v8
         env:
           TEAMS: ${{ steps.reviewers.outputs.teams }}
@@ -138,21 +137,31 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const { owner, repo } = context.repo;
-            const pull_number = context.payload.pull_request.number;
-
             const teams = JSON.parse(process.env.TEAMS);
 
-            console.log("Requesting reviewer teams:");
+            console.log(`Repository: ${owner}/${repo}`);
+            console.log(`Teams: ${JSON.stringify(teams)}`);
 
-            for (const team of teams) {
-              console.log(`- ${team}`);
+            for (const teamSlug of teams) {
+              console.log(`\nChecking team: ${teamSlug}`);
+
+              try {
+                const response = await github.rest.teams.getByName({
+                  org: owner,
+                  team_slug: teamSlug
+                });
+
+                console.log("SUCCESS");
+                console.log(`Team name: ${response.data.name}`);
+                console.log(`Team slug: ${response.data.slug}`);
+                console.log(`Team ID: ${response.data.id}`);
+                console.log(`Team node ID: ${response.data.node_id}`);
+
+              } catch (error) {
+                console.log("FAILED");
+                console.log(`HTTP status: ${error.status}`);
+                console.log(`Message: ${error.message}`);
+
+                throw error;
+              }
             }
-
-            await github.rest.pulls.requestReviewers({
-              owner,
-              repo,
-              pull_number,
-              team_reviewers: teams
-            });
-
-            console.log("Reviewer request completed.");
