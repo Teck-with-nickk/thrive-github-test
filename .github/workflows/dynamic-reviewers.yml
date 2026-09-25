@@ -194,7 +194,7 @@ jobs:
 
   validate-required-reviewers:
     name: Validate Required Team Approvals
-
+    if: github.event_name == 'pull_request_review'
     runs-on: ubuntu-latest
 
     steps:
